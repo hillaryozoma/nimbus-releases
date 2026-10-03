@@ -1,0 +1,175 @@
+name: Release
+
+# Builds Nimbus from the private source repository for Windows, macOS (Apple silicon and Intel) and
+# Linux, signs the updater artifacts, and attaches the installers plus the updater's latest.json to a
+# draft release here. Publishing the draft makes it the update installed copies download.
+#
+# Secrets in this repository:
+#   NIMBUS_SOURCE_KEY                   read-only deploy key for hillaryozoma/Nimbus (SSH private key)
+#   TAURI_SIGNING_PRIVATE_KEY           updater signing key (contents of nimbus-updater.key)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  only if that key has a password
+#   WINDOWS_CERTIFICATE                 optional: base64 of a code-signing .pfx; turns Windows signing on
+#   WINDOWS_CERTIFICATE_PASSWORD        optional: its password
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch or commit of hillaryozoma/Nimbus to build
+        required: true
+        default: main
+
+concurrency:
+  group: release-${{ inputs.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: hillaryozoma/Nimbus
+
+jobs:
+  draft:
+    name: Draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release-id: ${{ steps.release.outputs.id }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NIMBUS_SOURCE_KEY }}
+
+      - name: Check the version
+        id: version
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)
+          if [ "$pkg" != "$conf" ] || [ "$pkg" != "$crate" ]; then
+            echo "::error::Versions differ: package.json $pkg, tauri.conf.json $conf, Cargo.toml $crate"
+            exit 1
+          fi
+          case "$REF" in
+            v[0-9]*) if [ "$REF" != "v$pkg" ]; then echo "::error::Tag $REF does not match the app version v$pkg"; exit 1; fi ;;
+          esac
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
+
+      # One draft for all four builds, created up front so parallel jobs can't each make their own.
+      - name: Create or reuse the draft release
+        id: release
+        uses: actions/github-script@v9
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            const tag = `v${process.env.VERSION}`
+            const { owner, repo } = context.repo
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 })
+            let release = releases.find((r) => r.tag_name === tag)
+            if (release && !release.draft) {
+              core.setFailed(`${tag} is already published. Bump the version to release again.`)
+              return
+            }
+            if (!release) {
+              const body = [
+                'Download the installer for your system:',
+                '',
+                '- **Windows:** `Nimbus_*_x64-setup.exe` (installs for you, no admin rights needed) or `Nimbus_*_x64_en-US.msi`',
+                '- **macOS:** `Nimbus_*_aarch64.dmg` (Apple silicon) or `Nimbus_*_x64.dmg` (Intel)',
+                '- **Linux:** `.AppImage`, `.deb` or `.rpm`',
+                '',
+                'Unless these notes say otherwise, the installers are not code-signed, so Windows SmartScreen and macOS Gatekeeper ask for confirmation on first launch.',
+              ].join('\n')
+              ;({ data: release } = await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, target_commitish: context.sha, name: `Nimbus ${tag}`, body, draft: true,
+              }))
+            }
+            core.setOutput('id', String(release.id))
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: draft
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macOS Apple silicon
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macOS Intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: Linux x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NIMBUS_SOURCE_KEY }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+
+      # Windows code signing turns on by itself once WINDOWS_CERTIFICATE is set: the certificate is
+      # imported and its thumbprint passed to the Tauri bundler through an extra config file.
+      - name: Import the Windows code-signing certificate
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'nimbus-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          $conf = @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = 'sha256'; timestampUrl = 'http://timestamp.digicert.com' } } } | ConvertTo-Json -Depth 5
+          Set-Content -Path src-tauri/tauri.signing.conf.json -Value $conf
+          "TAURI_EXTRA_ARGS=--config src-tauri/tauri.signing.conf.json" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - run: npm ci
+
+      # Builds with `npm run tauri build`, signs the updater artifacts with the key below and
+      # uploads the installers, their .sig files and latest.json to the draft.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.draft.outputs.release-id }}
+          args: --target ${{ matrix.target }} ${{ env.TAURI_EXTRA_ARGS }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
