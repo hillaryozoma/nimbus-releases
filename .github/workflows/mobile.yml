@@ -127,8 +127,10 @@ jobs:
       - name: Run in the simulator and take screenshots
         run: |
           set -e
-          APP=$(find src-tauri/gen/apple/build -name '*.app' -path '*iphonesimulator*' | head -n 1)
+          # xcodebuild puts the simulator app in DerivedData
+          APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" src-tauri/gen/apple -type d -name '*.app' -path '*iphonesimulator*' 2>/dev/null | head -n 1)
           echo "App: $APP"
+          [ -n "$APP" ] || { echo '::error::No simulator app found'; exit 1; }
           DEVICE=$(xcrun simctl list devices available | grep -m1 -E 'iPhone 1[5-9]' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
           xcrun simctl boot "$DEVICE"
           xcrun simctl bootstatus "$DEVICE" -b
