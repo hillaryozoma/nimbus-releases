@@ -1,0 +1,190 @@
+name: Mobile
+
+# Builds the Nimbus phone apps from the private source repository:
+# - Android: a universal APK (signed with the release keystore when ANDROID_KEYSTORE is set,
+#   otherwise with a throwaway debug key for testing), uploaded as a workflow artifact.
+# - iOS: a simulator build, launched in the iOS Simulator for a screenshot. Device and App Store
+#   builds need an Apple Developer account (signing certificate and provisioning profile).
+#
+# Secrets: NIMBUS_SOURCE_KEY (read-only deploy key), optional ANDROID_KEYSTORE (base64 .jks),
+# ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch or commit of hillaryozoma/Nimbus to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: hillaryozoma/Nimbus
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NIMBUS_SOURCE_KEY }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android
+
+      - run: npm ci
+
+      - name: Build the APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/28.2.13676358
+        run: npx tauri android build --apk
+
+      - name: Sign the APK
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -e
+          BT="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -name '*universal*release*unsigned*.apk' -o -name '*universal*release*.apk' | head -n 1)
+          echo "APK: $APK"
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > release.jks
+            KS=release.jks; PASS="$KEYSTORE_PASSWORD"; ALIAS="$KEY_ALIAS"
+          else
+            echo "::warning::No ANDROID_KEYSTORE secret: signing with a throwaway key for testing only"
+            keytool -genkeypair -keystore test.jks -alias nimbus -keyalg RSA -keysize 2048 -validity 365 -storepass testtest -keypass testtest -dname "CN=Nimbus test"
+            KS=test.jks; PASS=testtest; ALIAS=nimbus
+          fi
+          "$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$PASS" --ks-key-alias "$ALIAS" --out Nimbus-android.apk aligned.apk
+          "$BT/apksigner" verify --print-certs Nimbus-android.apk | head -n 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus-android
+          path: Nimbus-android.apk
+
+  ios:
+    name: iOS simulator
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NIMBUS_SOURCE_KEY }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ios
+
+      - run: npm ci
+
+      - name: Generate the Xcode project
+        run: npx tauri ios init --ci
+
+      - name: Build for the simulator
+        run: npx tauri ios build --debug --target aarch64-sim
+
+      - name: Run in the simulator and take screenshots
+        run: |
+          set -e
+          APP=$(find src-tauri/gen/apple/build -name '*.app' -path '*iphonesimulator*' | head -n 1)
+          echo "App: $APP"
+          DEVICE=$(xcrun simctl list devices available | grep -m1 -E 'iPhone 1[5-9]' | sed -E 's/.*\(([0-9A-F-]{36})\).*/\1/')
+          xcrun simctl boot "$DEVICE"
+          xcrun simctl bootstatus "$DEVICE" -b
+          xcrun simctl install "$DEVICE" "$APP"
+          BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl launch "$DEVICE" "$BUNDLE"
+          sleep 25
+          xcrun simctl io "$DEVICE" screenshot ios-today.png
+          xcrun simctl ui "$DEVICE" appearance dark
+          sleep 5
+          xcrun simctl io "$DEVICE" screenshot ios-today-dark.png
+          cd "$(dirname "$APP")" && zip -qr "$GITHUB_WORKSPACE/Nimbus-ios-simulator.zip" "$(basename "$APP")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus-ios-simulator
+          path: |
+            Nimbus-ios-simulator.zip
+            ios-today*.png
+
+  macos-window:
+    name: macOS window screenshot
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.NIMBUS_SOURCE_KEY }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: macos-debug
+
+      - run: npm ci
+
+      - name: Build the app (debug, no bundle signing)
+        run: npx tauri build --debug --bundles app --config src-tauri/tauri.unsigned.conf.json
+
+      - name: Launch and capture the window
+        run: |
+          APP=$(find src-tauri/target/debug/bundle/macos -name '*.app' | head -n 1)
+          open "$APP"
+          sleep 30
+          screencapture -x macos-window.png || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nimbus-macos-window
+          path: macos-window.png
